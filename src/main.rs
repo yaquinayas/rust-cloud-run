@@ -3,7 +3,6 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::env;
 
-// Estado compartido para el pool de conexiones
 struct AppState {
     db_pool: PgPool,
 }
@@ -13,7 +12,6 @@ async fn hello() -> impl Responder {
     "Hello from Rust on Cloud Run!"
 }
 
-// Endpoint para probar la conexión a la BD
 #[get("/db-test")]
 async fn db_test(state: actix_web::web::Data<AppState>) -> impl Responder {
     match sqlx::query("SELECT 1 as test")
@@ -31,70 +29,69 @@ async fn db_test(state: actix_web::web::Data<AppState>) -> impl Responder {
     }
 }
 
-// Endpoint para ver la configuración (sin mostrar contraseña)
 #[get("/db-info")]
 async fn db_info() -> impl Responder {
     let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "No configurada".to_string());
-    // Ocultamos la contraseña por seguridad
-    let masked = if db_url.contains('@') {
-        // Reemplaza la contraseña con ***
-        let parts: Vec<&str> = db_url.split('@').collect();
-        if parts.len() == 2 {
-            let before = parts[0];
-            let after = parts[1];
-            if before.contains(':') {
-                let auth_parts: Vec<&str> = before.split(':').collect();
-                if auth_parts.len() == 2 {
-                    format!("{}:***@{}", auth_parts[0], after)
-                } else {
-                    db_url
-                }
-            } else {
-                db_url
-            }
-        } else {
-            db_url
-        }
-    } else {
-        db_url
-    };
+    let masked = mask_password(&db_url);
     
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "database_url_configured": env::var("DATABASE_URL").is_ok(),
         "database_url_masked": masked,
         "port": env::var("PORT").unwrap_or_else(|_| "8080".to_string()),
-        "cloud_run": env::var("K_SERVICE").is_ok(),
+        "environment": env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()),
     }))
+}
+
+fn mask_password(url: &str) -> String {
+    if url.contains('@') {
+        let parts: Vec<&str> = url.split('@').collect();
+        if parts.len() == 2 {
+            let before = parts[0];
+            let after = parts[1];
+            if before.contains(':') {
+                let auth_parts: Vec<&str> = before.split(':').collect();
+                if auth_parts.len() == 2 {
+                    return format!("{}:***@{}", auth_parts[0], after);
+                }
+            }
+        }
+    }
+    url.to_string()
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Cargar variables de entorno desde .env (solo para desarrollo local)
-    dotenv::dotenv().ok();
+    // Cargar .env solo en desarrollo
+    if env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()) == "development" {
+        dotenv::dotenv().ok();
+    }
     
-    // Configurar logging
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let database_url = env::var("DATABASE_URL")
-        .expect("❌ DATABASE_URL no está configurada! Revisa tus variables de entorno");
+        .expect("❌ DATABASE_URL no está configurada!");
+    
+    // Detectar si estamos usando socket Unix o TCP
+    let is_unix_socket = database_url.contains("/cloudsql/");
     
     println!("🚀 Iniciando aplicación...");
     println!("📡 Puerto: {}", port);
+    println!("🛢️  Tipo de conexión: {}", if is_unix_socket { "Unix Socket" } else { "TCP/IP" });
     println!("🛢️  Conectando a PostgreSQL...");
     
     // Crear pool de conexiones
     let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(std::time::Duration::from_secs(5))
+        .max_connections(if is_unix_socket { 10 } else { 5 })
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&database_url)
         .await
         .expect("❌ No se pudo conectar a PostgreSQL! Verifica DATABASE_URL");
     
     println!("✅ Conexión a PostgreSQL establecida!");
     
-    // Verificar conexión con un ping
+    // Verificar conexión
     match sqlx::query("SELECT 1").fetch_one(&pool).await {
         Ok(_) => println!("✅ Ping a BD exitoso"),
         Err(e) => eprintln!("⚠️  Ping a BD falló: {}", e),
