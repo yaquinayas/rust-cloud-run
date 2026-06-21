@@ -32,40 +32,41 @@ async fn db_test(state: actix_web::web::Data<AppState>) -> impl Responder {
 #[get("/db-info")]
 async fn db_info() -> impl Responder {
     let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "No configurada".to_string());
-    let masked = mask_password(&db_url);
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
-        "database_url_configured": env::var("DATABASE_URL").is_ok(),
-        "database_url_masked": masked,
-        "port": env::var("PORT").unwrap_or_else(|_| "8080".to_string()),
-        "environment": env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()),
-    }))
-}
-
-fn mask_password(url: &str) -> String {
-    if url.contains('@') {
-        let parts: Vec<&str> = url.split('@').collect();
+    let masked = if db_url.contains('@') {
+        let parts: Vec<&str> = db_url.split('@').collect();
         if parts.len() == 2 {
             let before = parts[0];
             let after = parts[1];
             if before.contains(':') {
                 let auth_parts: Vec<&str> = before.split(':').collect();
                 if auth_parts.len() == 2 {
-                    return format!("{}:***@{}", auth_parts[0], after);
+                    format!("{}:***@{}", auth_parts[0], after)
+                } else {
+                    db_url
                 }
+            } else {
+                db_url
             }
+        } else {
+            db_url
         }
-    }
-    url.to_string()
+    } else {
+        db_url
+    };
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "ok",
+        "database_url_configured": env::var("DATABASE_URL").is_ok(),
+        "database_url_masked": masked,
+        "port": env::var("PORT").unwrap_or_else(|_| "8080".to_string()),
+        "cloud_run": env::var("K_SERVICE").is_ok(),
+    }))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Cargar .env solo en desarrollo
-    if env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()) == "development" {
-        dotenv::dotenv().ok();
-    }
+    // Cargar variables de entorno
+    dotenv::dotenv().ok();
     
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     
@@ -73,46 +74,32 @@ async fn main() -> std::io::Result<()> {
     let database_url = env::var("DATABASE_URL")
         .expect("❌ DATABASE_URL no está configurada!");
     
-    // Detectar si estamos usando socket Unix o TCP
-    let is_unix_socket = database_url.contains("/cloudsql/");
-    
     println!("🚀 Iniciando aplicación...");
     println!("📡 Puerto: {}", port);
-    println!("🛢️  Tipo de conexión: {}", if is_unix_socket { "Unix Socket" } else { "TCP/IP" });
     println!("🛢️  Conectando a PostgreSQL...");
     
-    // Crear pool de conexiones
     let pool = PgPoolOptions::new()
-        .max_connections(if is_unix_socket { 10 } else { 5 })
-        .acquire_timeout(std::time::Duration::from_secs(10))
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .connect(&database_url)
         .await
-        .expect("❌ No se pudo conectar a PostgreSQL! Verifica DATABASE_URL");
+        .expect("❌ No se pudo conectar a PostgreSQL!");
     
     println!("✅ Conexión a PostgreSQL establecida!");
-    
-    // Verificar conexión
-    match sqlx::query("SELECT 1").fetch_one(&pool).await {
-        Ok(_) => println!("✅ Ping a BD exitoso"),
-        Err(e) => eprintln!("⚠️  Ping a BD falló: {}", e),
-    }
     
     let pool_clone = pool.clone();
     
     println!("🌐 Servidor iniciado en http://0.0.0.0:{}", port);
-    println!("📋 Endpoints disponibles:");
-    println!("   - GET /        → Mensaje de bienvenida");
-    println!("   - GET /db-test → Prueba de conexión a BD");
-    println!("   - GET /db-info → Información de configuración");
     
+    // 🔴 IMPORTANTE: Aquí es donde se registran TODOS los endpoints
     HttpServer::new(move || {
         App::new()
             .app_data(actix_web::web::Data::new(AppState {
                 db_pool: pool_clone.clone(),
             }))
-            .service(hello)
-            .service(db_test)
-            .service(db_info)
+            .service(hello)      // <- GET /
+            .service(db_test)    // <- GET /db-test
+            .service(db_info)    // <- GET /db-info
     })
     .bind(("0.0.0.0", port.parse::<u16>().unwrap()))?
     .run()
